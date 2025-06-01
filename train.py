@@ -6,7 +6,8 @@ from importlib import import_module
 from omegaconf import OmegaConf
 
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import TensorBoardLogger 
+from lightning_utilities.core.rank_zero import rank_zero_only
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader, ConcatDataset
 
@@ -16,8 +17,8 @@ from utils import save_args
 
 def build_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config_name", type=str, default=None)
-    parser.add_argument("--data_root_dir", type=str, default="./DATA/zalando-hd-resized")
+    parser.add_argument("--config_name", type=str, required=True)  # บังคับใส่ config_name
+    parser.add_argument("--data_root_dir", type=str, default="./DATA/VTIONHD")
     parser.add_argument("--category", type=str, default=None, choices=["upper", "lower_body", "dresses"])
     parser.add_argument("--vae_load_path", type=str, default="./ckpts/VITONHD_VAE_finetuning.ckpt")
     parser.add_argument("--batch_size", "-bs",  type=int, default=32)
@@ -29,6 +30,8 @@ def build_args():
     parser.add_argument("--max_epochs", type=int, default=1000)
     parser.add_argument("--save_root_dir", type=str, default="./logs")
     parser.add_argument("--save_name", type=str, default="dummy")
+    parser.add_argument("--devices", type=int, default="1")
+    parser.add_argument("--accelerator", type=str, default="gpu")
 
     parser.add_argument("--use_validation", action="store_false")
     parser.add_argument("--resume_path", type=str, default=None)
@@ -50,10 +53,20 @@ def build_args():
     parser.add_argument("--no_strict_load", action="store_true")    
     
     args = parser.parse_args()
-    
+
+    # กำหนด path config
     args.config_path = opj("./configs", f"{args.config_name}.yaml")
-    args.n_gpus = len(os.environ["CUDA_VISIBLE_DEVICES"].split(","))
-    args.devices = [i for i in range(args.n_gpus)]
+
+    # เช็ค CUDA_VISIBLE_DEVICES
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
+    if cuda_visible_devices.strip():
+        args.n_gpus = len(cuda_visible_devices.split(","))
+    else:
+        args.n_gpus = 0
+
+    # devices เป็น list หรือ None ถ้าไม่มี GPU
+    args.devices = list(range(args.n_gpus)) if args.n_gpus > 0 else None
     args.strategy = "auto"
     args.sd_locked = not args.sd_unlocked
     args.no_validation = not args.use_validation
@@ -66,15 +79,24 @@ def build_args():
     args.valid_img_save_dir = opj(args.save_dir, "validation_sampled_images")
     args.args_save_path = opj(args.save_dir, "args.json")
     args.config_save_path = opj(args.save_dir, "config.yaml")
+
     os.makedirs(args.img_save_dir, exist_ok=True)
     os.makedirs(args.model_save_dir, exist_ok=True)
     os.makedirs(args.tb_save_dir, exist_ok=True)
     os.makedirs(args.valid_img_save_dir, exist_ok=True)
     
     return args
+
 def build_config(args, config_path=None):
     if config_path is None: 
         config_path = args.config_path
+        
+    print(f"Loading config from: {config_path}")
+    print(f"Exists? {os.path.exists(config_path)}")
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
     config = OmegaConf.load(config_path)
     config.model.params.setdefault("use_VAEdownsample", False)
     config.model.params.setdefault("use_imageCLIP", False)
@@ -96,7 +118,7 @@ def build_config(args, config_path=None):
         if args.use_atv_loss:
             config.model.params.use_attn_mask = True
     return config
-    
+
 def main_worker(args):
     config = build_config(args)
     OmegaConf.save(config, args.config_save_path)
@@ -148,25 +170,29 @@ def main_worker(args):
         is_paired=False, 
         is_sorted=True, 
     )
+    
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Valid paired dataset size: {len(valid_paired_dataset)}")
+    print(f"Valid unpaired dataset size: {len(valid_unpaired_dataset)}")
       
     train_dataloader = DataLoader(
         train_dataset,
         num_workers=4, 
-        batch_size=max(args.batch_size//args.n_gpus, 1), 
+        batch_size=max(args.batch_size//max(args.n_gpus,1), 1), 
         shuffle=True, 
         pin_memory=True
     )
     valid_paired_dataloader = DataLoader(
         valid_paired_dataset, 
         num_workers=4, 
-        batch_size=max(args.batch_size//args.n_gpus, 1), 
+        batch_size=max(args.batch_size//max(args.n_gpus,1), 1), 
         shuffle=False, 
         pin_memory=True
     )
     valid_unpaired_dataloader = DataLoader(
         valid_unpaired_dataset, 
         num_workers=4, 
-        batch_size=max(args.batch_size//args.n_gpus, 1), 
+        batch_size=max(args.batch_size//max(args.n_gpus,1), 1), 
         shuffle=False, 
         pin_memory=True
     )
@@ -192,14 +218,22 @@ def main_worker(args):
         callbacks=[img_logger, cp_callback], 
         logger=tb_logger, 
         devices=args.devices,
-        accelerator="gpu", 
-        strategy="ddp", 
+        accelerator=args.accelerator,
+        strategy="ddp" if args.n_gpus > 1 else None, 
         max_epochs=args.max_epochs, 
         accumulate_grad_batches=args.accum_iter, 
         check_val_every_n_epoch=args.valid_epoch_freq,
         num_sanity_val_steps=args.num_sanity_val_steps
     )
     #### trainer <<<<
+    
+    print("Starting training...")
+    if not args.no_validation:
+        trainer.fit(model, train_dataloader, [valid_paired_dataloader, valid_unpaired_dataloader])
+    else:
+        trainer.fit(model, train_dataloader)
+    print("Training finished.")
+
     
     if not args.no_validation:
         trainer.fit(model, train_dataloader, [valid_paired_dataloader, valid_unpaired_dataloader])
@@ -209,6 +243,3 @@ def main_worker(args):
 if __name__ == "__main__":
     args = build_args()
     print(args)
-    save_args(args, args.args_save_path)
-    main_worker(args)
-    print("Done")
